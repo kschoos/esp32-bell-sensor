@@ -36,10 +36,24 @@
 #include <sys/param.h>
 #include "nvs_flash.h"
 #include "tcpip_adapter.h"
-#include "esp_eth.h"
 #include "protocol_examples_common.h"
 
-#include <esp_http_server.h>
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
+
+
+#ifdef CONFIG_EXAMPLE_IPV4
+#define HOST_IP_ADDR CONFIG_EXAMPLE_IPV4_ADDR
+#else
+#define HOST_IP_ADDR CONFIG_EXAMPLE_IPV6_ADDR
+#endif
+
+#define PORT CONFIG_EXAMPLE_PORT
+
+// static const char *payload = "Message from ESP32 ";
+static void tcp_client_task(void*);
 
 static const char *TAG = "main";
 TaskHandle_t taskHandle;
@@ -51,13 +65,14 @@ TaskHandle_t taskHandle;
 #define MIN_FINAL_FREQ_CNT 2
 #define MAX_FREQ_IDX 2
 #define FREQ_THRESHOLD -35.
+#define REC_LENGTH 2*SAMPLE_FREQ
 
 int N = N_SAMPLES;
 // Input test array
 uint16_t data[N_SAMPLES];
 uint16_t samples[N_SAMPLES];
 
-uint16_t recording[SAMPLE_FREQ*2];
+char recording[2 * REC_LENGTH];
 
 uint8_t freq_cnt = 0;
 uint8_t current_freq_idx = 0;
@@ -114,15 +129,15 @@ void IRAM_ATTR timer_group0_isr(void *para){
 
     if ((timer_intr & BIT(timer_idx)) && timer_idx == TIMER_0) {
         if (adc_initialized){
-            if (count == N-1){
+            if (count == N){
                 for(int i = 0; i < N; i++){
                     data[i] = samples[i];
                 }
                 count = 0;
                 xTaskNotifyFromISR(taskHandle, 0x00, eIncrement, NULL);
             } else {
-                count += 1;
                 samples[count] = local_adc1_read(ADC1_CHANNEL_6);
+                count += 1;
             }
         }
 
@@ -188,7 +203,13 @@ static float find_frequency(uint16_t freq){
     for (int i=0 ; i < N ; i++)
     {
         float val = (float) (data[i] - dc_offset) / fsr * wind[i];
-        recording[i + freq_cnt * N_SAMPLES + current_freq_idx * MAX_FREQ_CNT * N_SAMPLES] = data[i];
+        char lsB = data[i] & 0xFF;
+        char msB = (data[i] >> 8) & 0xFF;
+        int idx = 2 * (i + freq_cnt * N_SAMPLES + current_freq_idx * MAX_FREQ_CNT * N_SAMPLES);
+        
+        recording[idx] = data[i] & 0xFF;
+        recording[idx + 1] = (data[i] & 0xFF00) >> 8;
+
         y_cf[i*2] = val;
         y_cf[i*2 + 1] = y_cf[i*2];
     }
@@ -271,20 +292,10 @@ static void task(){
 
         accu += find_frequency(500);
 
-        if ( ulNotifiedValue % 10 == 0 ){
-            printf("%f\n", accu / 10);
-            accu = 0;
-        }
-
-        if ( current_freq_idx == MAX_FREQ_IDX && freq_cnt >= MIN_FINAL_FREQ_CNT ) {
-            gpio_set_level(GPIO_OUTPUT_0, 1);
-            freq_cnt = 0;
-            current_freq_idx = 0;
-
-            for (int k = 0; k < SAMPLE_FREQ * 2; k++){
-                printf("%d, ", recording[k]);
-            }
-        }
+        // if ( ulNotifiedValue % 10 == 0 ){
+        //     printf("%f\n", accu / 10);
+        //     accu = 0;
+        // }
 
         if ( freq_cnt < MAX_FREQ_CNT ){
             if ( find_frequency(freq) >= FREQ_THRESHOLD ){
@@ -294,7 +305,13 @@ static void task(){
                 current_freq_idx = 0;
             }
         } else {
-             if ( find_frequency(next_freq) >= FREQ_THRESHOLD ){
+             if ( current_freq_idx == MAX_FREQ_IDX){
+                gpio_set_level(GPIO_OUTPUT_0, 1);
+                freq_cnt = 0;
+                current_freq_idx = 0;
+                xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 5, NULL);
+             }
+             else if ( find_frequency(next_freq) >= FREQ_THRESHOLD ){
                  current_freq_idx += 1;
                  freq_cnt = 1;
              } else if ( find_frequency(freq) >= FREQ_THRESHOLD ){
@@ -305,6 +322,61 @@ static void task(){
              }
         } 
     }
+}
+
+static void tcp_client_task(void *pvParameters)
+{
+    char addr_str[128];
+    int addr_family;
+    int ip_protocol;
+
+    do{
+    #ifdef CONFIG_EXAMPLE_IPV4
+        struct sockaddr_in dest_addr;
+        dest_addr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(PORT);
+        addr_family = AF_INET;
+        ip_protocol = IPPROTO_IP;
+        inet_ntoa_r(dest_addr.sin_addr, addr_str, sizeof(addr_str) - 1);
+    #else // IPV6
+        struct sockaddr_in6 dest_addr;
+        inet6_aton(HOST_IP_ADDR, &dest_addr.sin6_addr);
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons(PORT);
+        addr_family = AF_INET6;
+        ip_protocol = IPPROTO_IPV6;
+        inet6_ntoa_r(dest_addr.sin6_addr, addr_str, sizeof(addr_str) - 1);
+    #endif
+
+        int sock =  socket(addr_family, SOCK_STREAM, ip_protocol);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            break;
+        }
+        ESP_LOGI(TAG, "Socket created, connecting to %s:%d", HOST_IP_ADDR, PORT);
+
+        int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err != 0) {
+            ESP_LOGE(TAG, "Socket unable to connect: errno %d", errno);
+            break;
+        }
+        ESP_LOGI(TAG, "Successfully connected");
+
+        err = send(sock, recording, 2 * REC_LENGTH, 0);
+        if (err < 0) {
+            ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+            break;
+        }
+
+        if (sock != -1) {
+            ESP_LOGE(TAG, "Shutting down socket and restarting...");
+            shutdown(sock, 0);
+            close(sock);
+        }
+    } while(0);
+
+    vTaskDelete(NULL);
 }
 
 void app_main()
@@ -322,4 +394,14 @@ void app_main()
     gpio_set_level(GPIO_OUTPUT_0, 1);
 
     xTaskCreate(task, "task", 2048, NULL, 5, &taskHandle);
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+    tcpip_adapter_init();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
+     * Read "Establishing Wi-Fi or Ethernet Connection" section in
+     * examples/protocols/README.md for more information about this function.
+     */
+    ESP_ERROR_CHECK(example_connect());
 }

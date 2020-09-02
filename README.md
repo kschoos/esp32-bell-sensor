@@ -9,7 +9,7 @@ It continuously samples the sound around it. It looks for a certain frequency pa
 When this pattern is found, it notifies the user via TCP and also sends the data packet that triggered the notification.
 This way, the user can check manually if it was a false alarm or not.
 
-# Technology?
+## Technology?
 This program runs on an ESP-32. The rest of the circuitry is just a condenser microphone, an Op-Amp and some other passive components.
 
 
